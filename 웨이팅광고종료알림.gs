@@ -36,13 +36,13 @@ var WAITING_EXPIRY_CONFIG = {
 
 // 담당자명 → Slack User ID
 var SLACK_USER_IDS = {
-  "이도은": "U093FJ7DZ8W", "서성원": "U04JS25AH42", "조완수": "U027RCFP55W",
+  "이도은": "U093FJ7DZ8W", "최원영": "U0BLAHC00G3", "권용덕": "U0BLDGBS8G5",
   "남현욱": "U07RH97HNQL", "우은수": "U093FJ573FY", "이종익": "U0AGLUM2G2V",
-  "정재호": "U07SFD94E5R", "홍성혁": "U02TN1U2PQR", "이하윤": "U0AJ3LN8E3T",
-  "이조은": "U09GZ0H7928", "이동헌": "U0AG4JQJVKP", "이승준": "U09E3L1KFQR",
+  "김나현": "U0B99RC7H08", "홍성혁": "U02TN1U2PQR", "이하윤": "U0AJ3LN8E3T",
+  "이조은": "U09GZ0H7928", "이동헌": "U0AG4JQJVKP", "김현수": "U0BHGG7FP98",
   "전평정": "U02QCTZT2PP", "이세한": "U09BZ6JL60G", "이혜민": "U0AJY0DSMPC",
   "김상하": "U0AG600HV1U", "이승민": "U0AG1KQQFS7", "한창완": "U057M7S5RA9",
-  "신유빈": "U09MXM4BV71"
+  "신유빈": "U09MXM4BV71", "이지민": "U0BGDNGHUBC"
 };
 
 function notifyWaitingExpiryDMOnly() {
