@@ -433,11 +433,13 @@ function overdueBuildUnmappedMessages_(unmapped) {
     return lines.join("\n");
   });
 
-  var header = "🚨 *담당자에게 개인 DM을 보낼 수 없어 팀장님께 전달드리는 미입금 건입니다.*\n\n" +
-               "🔴 *" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
-               "_슬랙 계정을 찾을 수 없는 담당자(퇴사자·외부 인력 추정) 건이라 인수 확인이 필요합니다._\n";
-  var footer = "⚠️ 담당자가 재직 중이라면 스크립트의 " +
-               "`OVERDUE_DM_SLACK_USER_IDS`에 슬랙 ID를 추가해주세요.";
+  function header(part) {
+    return "🚨 *퇴사자 미입금 알림*" + part + "\n\n" +
+           "🔴 *" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
+           "아래 건은 퇴사자가 입금 팔로우업을 하지 않고 간 건입니다. 확인 부탁드립니다.\n";
+  }
+  var footer = "⚠️ 담당자가 재직 중인데 목록에 올라왔다면 슬랙 ID 매핑이 누락된 경우이니 알려주세요.\n" +
+               "(스크립트의 `OVERDUE_DM_SLACK_USER_IDS`에 추가하면 담당자 본인에게 직접 발송됩니다.)";
 
   var chunks = [], current = [], currentLen = 0;
   sections.forEach(function(section) {
@@ -451,7 +453,7 @@ function overdueBuildUnmappedMessages_(unmapped) {
 
   return chunks.map(function(chunk, idx) {
     var part = chunks.length > 1 ? " (" + (idx + 1) + "/" + chunks.length + ")" : "";
-    var body = header.replace("미입금 건입니다.*", "미입금 건입니다.*" + part) + "\n" + chunk.join("\n\n");
+    var body = header(part) + "\n" + chunk.join("\n\n");
     return idx === chunks.length - 1 ? body + "\n\n" + footer : body;
   });
 }
