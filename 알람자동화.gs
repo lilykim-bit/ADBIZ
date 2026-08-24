@@ -35,10 +35,21 @@ function getSlackToken_() {
   return t;
 }
 
-function getWebhookSecret_() {
-  const s = PropertiesService.getScriptProperties().getProperty('WEBHOOK_SHARED_SECRET');
-  if (!s) throw new Error('스크립트 속성 WEBHOOK_SHARED_SECRET 이 설정되지 않았습니다.');
-  return s;
+/**
+ * 웹훅 시크릿 검증. 무중단 로테이션을 위해 두 개를 동시에 허용한다.
+ *   WEBHOOK_SHARED_SECRET       : 현재(신규) 값
+ *   WEBHOOK_SHARED_SECRET_PREV  : 직전 값 (호출 측 갱신이 끝나면 삭제)
+ * 두 속성 모두 없으면 설정 누락이므로 명시적으로 실패시킨다.
+ */
+function isValidWebhookSecret_(provided) {
+  const props = PropertiesService.getScriptProperties();
+  const current = props.getProperty('WEBHOOK_SHARED_SECRET');
+  const previous = props.getProperty('WEBHOOK_SHARED_SECRET_PREV');
+  if (!current && !previous) {
+    throw new Error('스크립트 속성 WEBHOOK_SHARED_SECRET 이 설정되지 않았습니다.');
+  }
+  if (!provided) return false;
+  return provided === current || (!!previous && provided === previous);
 }
 
 const STATE_HEADERS = [
@@ -1019,6 +1030,18 @@ function diagnoseStateSheet() {
   Logger.log('상태별: ' + JSON.stringify(byState));
 }
 
+/** 시크릿 설정 상태만 확인 (값 자체는 출력하지 않는다) */
+function diagnoseWebhookSecret() {
+  const props = PropertiesService.getScriptProperties();
+  const cur = props.getProperty('WEBHOOK_SHARED_SECRET');
+  const prev = props.getProperty('WEBHOOK_SHARED_SECRET_PREV');
+  const mask = function (v) { return v ? '설정됨 (' + v.length + '자, 끝 4자 …' + v.slice(-4) + ')' : '없음'; };
+  Logger.log('WEBHOOK_SHARED_SECRET: ' + mask(cur));
+  Logger.log('WEBHOOK_SHARED_SECRET_PREV: ' + mask(prev) +
+             (prev ? '  ← 호출 측 갱신이 끝나면 삭제하세요' : ''));
+  if (!cur && !prev) Logger.log('⚠️ 둘 다 없습니다. doPost 호출이 전부 실패합니다.');
+}
+
 /** ===================== 외부 호출용 Slack 메시지 발송 웹앱 ===================== */
 /** catchweek-lms-send 등 외부에서 호출. 시크릿은 스크립트 속성에서 읽는다. */
 const WEBHOOK_ALLOWED_CHANNELS = ['C08731XUE95', 'C07G05CCGSX', 'C09SQQ000H2', 'C095PRYDE12', 'C09C2DWQXB8'];
@@ -1029,7 +1052,7 @@ function doPost(e) {
   };
   try {
     const body = JSON.parse(e.postData.contents);
-    if (body.secret !== getWebhookSecret_()) return json({ ok: false, error: 'unauthorized' });
+    if (!isValidWebhookSecret_(body.secret)) return json({ ok: false, error: 'unauthorized' });
 
     const channel = body.channel;
     const text = body.message;
