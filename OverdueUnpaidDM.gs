@@ -33,6 +33,11 @@ var OVERDUE_DM_CONFIG = {
   // 리스트를 잘라내지 않고 나눠 보내므로 누락되는 매장이 없음.
   MAX_CHARS_PER_DM: 3000,
 
+  // 슬랙 ID를 못 찾은 담당자(퇴사자/외부 인력 등)의 건을 모아 보낼 수신자.
+  // 담당자가 없는 미수금은 팀장이 인수해야 하므로 팀장에게 전달한다.
+  // 비워두면 해당 건은 아무에게도 전달되지 않고 로그에만 남는다.
+  FALLBACK_SLACK_ID: "U0B2CNXM7LN",  // 김지운 팀장 (Business Growth Leader)
+
   // 테스트 모드: true면 실제 담당자에게 보내지 않고 TEST_TARGET_SLACK_ID 한 명에게만 발송
   TEST_MODE: false,
   TEST_TARGET_SLACK_ID: "U07RBU2TKNH",  // 김승현
@@ -46,7 +51,8 @@ var OVERDUE_DM_SLACK_USER_IDS = {
   "남윤석": "U0BQ3UL4Z5L", "남현욱": "U07RH97HNQL", "신유빈": "U09MXM4BV71", "우은수": "U093FJ573FY",
   "이도은": "U093FJ7DZ8W", "이세한": "U09BZ6JL60G", "이승준": "U09E3L1KFQR", "이조은": "U09GZ0H7928",
   "이종익": "U0AGLUM2G2V", "이하윤": "U0AJ3LN8E3T", "이혜민": "U0AJY0DSMPC", "전평정": "U02QCTZT2PP",
-  "최원영": "U0BLAHC00G3", "한창완": "U057M7S5RA9", "홍성혁": "U02TN1U2PQR"
+  "최원영": "U0BLAHC00G3", "한창완": "U057M7S5RA9", "홍성혁": "U02TN1U2PQR",
+  "김이슬": "U09ACJEAJSJ", "조완수": "U027RCFP55W", "이지민": "U0BGDNGHUBC"
 };
 
 // 계약현황 탭 컬럼.
@@ -109,6 +115,21 @@ function runOverdueNotification_(dryRun) {
     }
   }
 
+  // 슬랙 ID 없는 담당자 건은 폴백 수신자에게 모아서 전달 (조용히 사라지지 않게)
+  var unmappedNames = Object.keys(report.unmapped);
+  if (unmappedNames.length > 0 && OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID) {
+    var fallbackMsgs = overdueBuildUnmappedMessages_(report.unmapped);
+    for (var f = 0; f < fallbackMsgs.length; f++) {
+      if (dryRun) {
+        Logger.log("[DRY RUN] → 폴백(" + OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID + ")\n" + fallbackMsgs[f]);
+        sent++;
+      } else {
+        sendOverdueSlackDM_(token, OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID, fallbackMsgs[f]) ? sent++ : failed++;
+        Utilities.sleep(OVERDUE_DM_CONFIG.SEND_INTERVAL_MS);
+      }
+    }
+  }
+
   var summary = "대상 " + report.totalItems + "건 / 담당자 " +
                 Object.keys(report.byManager).length + "명 / DM " + sent + "건 발송" +
                 (failed ? " (실패 " + failed + "건)" : "") +
@@ -128,8 +149,8 @@ function runOverdueNotification_(dryRun) {
   // 슬랙 ID 미등록 담당자는 조용히 빠지면 영구 누락되므로 반드시 남긴다
   var unmapped = Object.keys(report.unmapped);
   if (unmapped.length > 0) {
-    Logger.log("⚠️ OVERDUE_DM_SLACK_USER_IDS 미등록으로 발송 제외된 담당자: " +
-      unmapped.map(function(n) { return n + "(" + report.unmapped[n] + "건)"; }).join(", "));
+    Logger.log("⚠️ OVERDUE_DM_SLACK_USER_IDS 미등록 담당자: " +
+      unmapped.map(function(n) { return n + "(" + report.unmapped[n].count + "건)"; }).join(", "));
   }
 
   return summary;
@@ -274,16 +295,13 @@ function collectOverdueItems_() {
 
     var managerName = String(row[col.manager] || "").trim() || "담당자미지정";
     var slackId = OVERDUE_DM_SLACK_USER_IDS[managerName];
-    if (!slackId) {
-      funnel.슬랙ID미등록++;
-      unmapped[managerName] = (unmapped[managerName] || 0) + 1;
-      continue;
-    }
 
-    if (!byManager[managerName]) {
-      byManager[managerName] = { slackId: slackId, ads: {}, count: 0, amount: 0 };
+    // 슬랙 ID가 없어도 건수만 세고 버리지 않는다. 상세를 모아 폴백 수신자에게 전달한다.
+    var bucket = slackId ? byManager : unmapped;
+    if (!bucket[managerName]) {
+      bucket[managerName] = { slackId: slackId || null, ads: {}, count: 0, amount: 0 };
     }
-    var manager = byManager[managerName];
+    var manager = bucket[managerName];
 
     var adTitle = String(row[col.adName]).trim().split('_')[0].trim();
     if (!manager.ads[adTitle]) manager.ads[adTitle] = [];
@@ -297,6 +315,8 @@ function collectOverdueItems_() {
 
     manager.count++;
     manager.amount += contractPrice;
+
+    if (!slackId) { funnel.슬랙ID미등록++; continue; }
     totalItems++;
   }
   funnel.최종대상 = totalItems;
@@ -381,7 +401,7 @@ function diagnoseOverdueFilters() {
   var unmapped = Object.keys(report.unmapped);
   if (unmapped.length) {
     lines.push("슬랙ID 미등록 담당자: " + unmapped.map(function(n) {
-      return n + "(" + report.unmapped[n] + "건)"; }).join(", "));
+      return n + "(" + report.unmapped[n].count + "건)"; }).join(", "));
   }
   lines.push("");
   lines.push("최종 발송 대상: " + report.totalItems + "건 / 담당자 " + Object.keys(report.byManager).length + "명");
@@ -389,6 +409,51 @@ function diagnoseOverdueFilters() {
   var out = lines.join("\n");
   Logger.log(out);
   return out;
+}
+
+/** 슬랙 ID를 못 찾은 담당자들의 건을 폴백 수신자용으로 묶는다 */
+function overdueBuildUnmappedMessages_(unmapped) {
+  var names = Object.keys(unmapped).sort(function(a, b) {
+    return unmapped[b].count - unmapped[a].count;
+  });
+  var totalCount = 0, totalAmount = 0;
+  names.forEach(function(n) { totalCount += unmapped[n].count; totalAmount += unmapped[n].amount; });
+
+  var sections = names.map(function(name) {
+    var entry = unmapped[name];
+    var lines = ["👤 *" + name + "* " + entry.count + "건 · " + overdueWon_(entry.amount)];
+    Object.keys(entry.ads).sort().forEach(function(adTitle) {
+      var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
+      lines.push("  📦 [" + adTitle + "]");
+      stores.forEach(function(st) {
+        lines.push("    • " + st.storeName + "(" + st.seq + ") — " + overdueWon_(st.price) +
+                   " · 마감 " + overdueMmdd_(st.dueDate) + " (D+" + st.overdueDays + ")");
+      });
+    });
+    return lines.join("\n");
+  });
+
+  var header = "🚨 *담당자에게 개인 DM을 보낼 수 없어 팀장님께 전달드리는 미입금 건입니다.*\n\n" +
+               "🔴 *" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
+               "_슬랙 계정을 찾을 수 없는 담당자(퇴사자·외부 인력 추정) 건이라 인수 확인이 필요합니다._\n";
+  var footer = "⚠️ 담당자가 재직 중이라면 스크립트의 " +
+               "`OVERDUE_DM_SLACK_USER_IDS`에 슬랙 ID를 추가해주세요.";
+
+  var chunks = [], current = [], currentLen = 0;
+  sections.forEach(function(section) {
+    if (current.length > 0 && currentLen + section.length > OVERDUE_DM_CONFIG.MAX_CHARS_PER_DM) {
+      chunks.push(current); current = []; currentLen = 0;
+    }
+    current.push(section);
+    currentLen += section.length + 2;
+  });
+  if (current.length > 0) chunks.push(current);
+
+  return chunks.map(function(chunk, idx) {
+    var part = chunks.length > 1 ? " (" + (idx + 1) + "/" + chunks.length + ")" : "";
+    var body = header.replace("미입금 건입니다.*", "미입금 건입니다.*" + part) + "\n" + chunk.join("\n\n");
+    return idx === chunks.length - 1 ? body + "\n\n" + footer : body;
+  });
 }
 
 /** 담당자 1명의 DM 본문 생성. 길면 여러 개로 분할해서 배열로 반환 */
