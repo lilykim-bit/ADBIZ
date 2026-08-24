@@ -42,18 +42,24 @@ var OVERDUE_DM_SLACK_USER_IDS = {
   "최원영": "U0BLAHC00G3", "한창완": "U057M7S5RA9", "홍성혁": "U02TN1U2PQR"
 };
 
-// 계약현황 탭 컬럼 인덱스 (0-based)
-var OVERDUE_DM_COL = {
-  seq: 2,          // C열: 계약_매장시퀀스
-  storeName: 3,    // D열: 계약_매장명
-  adName: 5,       // F열: 계약_광고명
-  manager: 6,      // G열: 계약_담당자 (영업담당자)
-  endDate: 8,      // I열: 종료일
-  dueDate: 10,     // K열: 입금 마감일
-  price: 11,       // L열: 계약대금
-  signStatus: 25,  // Z열: 계약상태
-  payStatus: 37    // AL열: 결제일
+// 계약현황 탭 컬럼.
+// 헤더명으로 찾는 것이 원칙이고, 헤더를 못 찾으면 fallback 인덱스(0-based)를 쓴다.
+// 미러링 시트의 IMPORTRANGE 범위가 바뀌어 컬럼이 밀리거나 잘려도
+// 조용히 0건이 되지 않고 경고/에러로 드러나게 하는 것이 목적.
+var OVERDUE_DM_COL_SPEC = {
+  seq:        { header: "계약_매장시퀀스", fallback: 2  },  // C열
+  storeName:  { header: "계약_매장명",     fallback: 3  },  // D열
+  adName:     { header: "계약_광고명",     fallback: 5  },  // F열
+  manager:    { header: "계약_담당자",     fallback: 6  },  // G열
+  endDate:    { header: "종료일",          fallback: 8  },  // I열
+  dueDate:    { header: "입금 마감일",     fallback: 10 },  // K열
+  price:      { header: "계약대금",        fallback: 11 },  // L열
+  signStatus: { header: "계약상태",        fallback: 25 },  // Z열
+  payStatus:  { header: "결제일",          fallback: 37 }   // AL열
 };
+
+// 계약상태가 이 값이면 서명 완료로 본다 (공백 제거 후 비교)
+var OVERDUE_DM_SIGNED_VALUE = "계약서 서명 완료";
 
 // ===== 메인 =====
 
@@ -103,6 +109,15 @@ function runOverdueNotification_(dryRun) {
                 (OVERDUE_DM_CONFIG.TEST_MODE ? " [TEST_MODE]" : "");
   Logger.log(summary);
 
+  // 0건이면 "대상 0건"만 보고 끝내지 않고 어느 필터에서 죽었는지 같이 남긴다
+  if (report.totalItems === 0) {
+    Logger.log("⚠️ 대상 0건 — 단계별 탈락 내역:");
+    Object.keys(report.funnel).forEach(function(k) { Logger.log("   " + k + ": " + report.funnel[k]); });
+    Logger.log("   계약상태 실제 값 분포: " + JSON.stringify(report.samples.계약상태값));
+    if (report.fellBack.length > 0) Logger.log("   ⚠️ 고정 인덱스로 대체된 컬럼: " + report.fellBack.join(", "));
+    Logger.log("   자세한 진단은 diagnoseOverdueFilters() 실행");
+  }
+
   // 슬랙 ID 미등록 담당자는 조용히 빠지면 영구 누락되므로 반드시 남긴다
   var unmapped = Object.keys(report.unmapped);
   if (unmapped.length > 0) {
@@ -113,40 +128,100 @@ function runOverdueNotification_(dryRun) {
   return summary;
 }
 
-/** 시트를 스캔해 담당자별 미입금 건을 취합 */
+/** 헤더 행에서 컬럼 위치를 해석 */
+function overdueResolveColumns_(headers) {
+  var norm = function(v) { return String(v == null ? "" : v).replace(/\s+/g, ""); };
+  var byName = {};
+  for (var i = 0; i < headers.length; i++) {
+    var k = norm(headers[i]);
+    if (k && !(k in byName)) byName[k] = i;
+  }
+
+  var col = {}, missing = [], fellBack = [];
+  Object.keys(OVERDUE_DM_COL_SPEC).forEach(function(key) {
+    var spec = OVERDUE_DM_COL_SPEC[key];
+    var k = norm(spec.header);
+    if (k in byName) { col[key] = byName[k]; return; }
+    if (spec.fallback < headers.length) {
+      col[key] = spec.fallback;
+      fellBack.push(spec.header + "→" + spec.fallback + "번째열('" + headers[spec.fallback] + "')");
+      return;
+    }
+    col[key] = -1;
+    missing.push(spec.header);
+  });
+  return { col: col, missing: missing, fellBack: fellBack };
+}
+
+/**
+ * 시트를 스캔해 담당자별 미입금 건을 취합.
+ * 단계별 탈락 건수(funnel)와 실제 값 샘플을 함께 반환해서
+ * "대상 0건"이 나왔을 때 어느 필터에서 죽었는지 바로 알 수 있게 한다.
+ */
 function collectOverdueItems_() {
-  var sheet = SpreadsheetApp.openById(OVERDUE_DM_CONFIG.SPREADSHEET_ID).getSheetByName(OVERDUE_DM_CONFIG.SHEET_NAME);
+  var sheet = SpreadsheetApp.openById(OVERDUE_DM_CONFIG.SPREADSHEET_ID)
+                            .getSheetByName(OVERDUE_DM_CONFIG.SHEET_NAME);
   if (!sheet) throw new Error("'" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭을 찾을 수 없습니다.");
 
   var data = sheet.getDataRange().getValues();
+  if (data.length < 2) throw new Error("'" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭에 데이터 행이 없습니다.");
+
+  var headers = data[0];
+  var resolved = overdueResolveColumns_(headers);
+  var col = resolved.col;
+  if (resolved.missing.length > 0) {
+    throw new Error("계약현황 탭에서 다음 컬럼을 찾을 수 없습니다: " + resolved.missing.join(", ") +
+      " / 시트 컬럼 수=" + headers.length + " / 실제 헤더=[" + headers.join(" | ") + "]");
+  }
+
   var today = overdueStartOfDay_(new Date());
   var byManager = {};
   var unmapped = {};
   var totalItems = 0;
 
+  // 진단용 집계
+  var funnel = { 전체행: data.length - 1, 광고명공란: 0, 서명미완료: 0, 결제일있음: 0,
+                 종료일파싱실패: 0, 종료일연도미달: 0, 마감일파싱실패: 0,
+                 마감일미래: 0, 금액0: 0, 슬랙ID미등록: 0, 최종대상: 0 };
+  var samples = { 계약상태값: {}, 결제일값: [], 종료일원본: [], 마감일원본: [] };
+  var tally = function(map, value) {
+    var k = "[" + String(value) + "]";
+    if (Object.keys(map).length < 25 || (k in map)) map[k] = (map[k] || 0) + 1;
+  };
+  var keep = function(arr, value) {
+    if (arr.length < 5) arr.push("[" + String(value) + "]");
+  };
+
   for (var i = 1; i < data.length; i++) {
     var row = data[i];
-    if (!row[OVERDUE_DM_COL.adName]) continue;
+    if (!row[col.adName]) { funnel.광고명공란++; continue; }
 
     // [필터 1] 서명 완료 / 결제 미완료
-    if (String(row[OVERDUE_DM_COL.signStatus] || "").trim() !== "계약서 서명 완료") continue;
-    if (String(row[OVERDUE_DM_COL.payStatus] || "").trim() !== "") continue;
+    var signStatus = String(row[col.signStatus] || "").trim();
+    tally(samples.계약상태값, signStatus);
+    if (signStatus !== OVERDUE_DM_SIGNED_VALUE) { funnel.서명미완료++; continue; }
+
+    var payStatus = String(row[col.payStatus] || "").trim();
+    if (payStatus !== "") { funnel.결제일있음++; keep(samples.결제일값, payStatus); continue; }
 
     // [필터 2] 종료일이 MIN_END_YEAR년 이후
-    var endDate = overdueParseDate_(row[OVERDUE_DM_COL.endDate]);
-    if (!endDate || endDate.getFullYear() < OVERDUE_DM_CONFIG.MIN_END_YEAR) continue;
+    var endDate = overdueParseDate_(row[col.endDate]);
+    if (!endDate) { funnel.종료일파싱실패++; keep(samples.종료일원본, row[col.endDate]); continue; }
+    if (endDate.getFullYear() < OVERDUE_DM_CONFIG.MIN_END_YEAR) { funnel.종료일연도미달++; continue; }
 
     // [필터 3] 입금 마감일이 오늘 이전(과거)
-    var dueDate = overdueParseDate_(row[OVERDUE_DM_COL.dueDate]);
-    if (!dueDate || dueDate.getTime() >= today.getTime()) continue;
+    var dueDate = overdueParseDate_(row[col.dueDate]);
+    if (!dueDate) { funnel.마감일파싱실패++; keep(samples.마감일원본, row[col.dueDate]); continue; }
+    if (dueDate.getTime() >= today.getTime()) { funnel.마감일미래++; continue; }
 
     // [필터 4] 계약대금 0원 제외
-    var contractPrice = overdueToNumber_(row[OVERDUE_DM_COL.price]);
-    if (contractPrice <= 0) continue;
+    var contractPrice = overdueToNumber_(row[col.price]);
+    if (contractPrice <= 0) { funnel.금액0++; continue; }
 
-    var managerName = String(row[OVERDUE_DM_COL.manager] || "").trim() || "담당자미지정";
+    var managerName = String(row[col.manager] || "").trim() || "담당자미지정";
     var slackId = OVERDUE_DM_SLACK_USER_IDS[managerName];
     if (!slackId) {
+      funnel.슬랙ID미등록++;
       unmapped[managerName] = (unmapped[managerName] || 0) + 1;
       continue;
     }
@@ -156,11 +231,11 @@ function collectOverdueItems_() {
     }
     var manager = byManager[managerName];
 
-    var adTitle = String(row[OVERDUE_DM_COL.adName]).trim().split('_')[0].trim();
+    var adTitle = String(row[col.adName]).trim().split('_')[0].trim();
     if (!manager.ads[adTitle]) manager.ads[adTitle] = [];
     manager.ads[adTitle].push({
-      storeName: String(row[OVERDUE_DM_COL.storeName] || "").trim(),
-      seq: row[OVERDUE_DM_COL.seq],
+      storeName: String(row[col.storeName] || "").trim(),
+      seq: row[col.seq],
       price: contractPrice,
       dueDate: dueDate,
       overdueDays: Math.round((today.getTime() - dueDate.getTime()) / 86400000)
@@ -170,8 +245,49 @@ function collectOverdueItems_() {
     manager.amount += contractPrice;
     totalItems++;
   }
+  funnel.최종대상 = totalItems;
 
-  return { byManager: byManager, unmapped: unmapped, totalItems: totalItems };
+  return {
+    byManager: byManager, unmapped: unmapped, totalItems: totalItems,
+    funnel: funnel, samples: samples, headers: headers,
+    resolvedCol: col, fellBack: resolved.fellBack
+  };
+}
+
+/** 왜 대상이 0건인지(혹은 몇 건인지) 단계별로 로그 출력 — 발송 안 함 */
+function diagnoseOverdueFilters() {
+  var report = collectOverdueItems_();
+  var lines = [];
+
+  lines.push("=== 계약현황 스캔 진단 ===");
+  lines.push("시트 컬럼 수: " + report.headers.length);
+  lines.push("해석된 컬럼 위치: " + JSON.stringify(report.resolvedCol));
+  if (report.fellBack.length > 0) {
+    lines.push("⚠️ 헤더명으로 못 찾아 고정 인덱스로 대체한 컬럼: " + report.fellBack.join(", "));
+  }
+  lines.push("");
+  lines.push("--- 단계별 탈락 건수 ---");
+  Object.keys(report.funnel).forEach(function(k) { lines.push("  " + k + ": " + report.funnel[k]); });
+  lines.push("");
+  lines.push("--- 계약상태 실제 값 분포 (기대값: '" + OVERDUE_DM_SIGNED_VALUE + "') ---");
+  Object.keys(report.samples.계약상태값).forEach(function(k) {
+    lines.push("  " + k + " : " + report.samples.계약상태값[k] + "건");
+  });
+  if (report.samples.종료일원본.length) lines.push("종료일 파싱실패 샘플: " + report.samples.종료일원본.join(", "));
+  if (report.samples.마감일원본.length) lines.push("마감일 파싱실패 샘플: " + report.samples.마감일원본.join(", "));
+  if (report.samples.결제일값.length) lines.push("결제일 값 샘플(=결제완료로 제외됨): " + report.samples.결제일값.join(", "));
+
+  var unmapped = Object.keys(report.unmapped);
+  if (unmapped.length) {
+    lines.push("슬랙ID 미등록 담당자: " + unmapped.map(function(n) {
+      return n + "(" + report.unmapped[n] + "건)"; }).join(", "));
+  }
+  lines.push("");
+  lines.push("최종 발송 대상: " + report.totalItems + "건 / 담당자 " + Object.keys(report.byManager).length + "명");
+
+  var out = lines.join("\n");
+  Logger.log(out);
+  return out;
 }
 
 /** 담당자 1명의 DM 본문 생성. 길면 여러 개로 분할해서 배열로 반환 */
