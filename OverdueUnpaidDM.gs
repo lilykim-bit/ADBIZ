@@ -18,7 +18,14 @@
 
 // ===== 설정 =====
 var OVERDUE_DM_CONFIG = {
+  // 미러링 시트 ([광고비즈니스] 고가광고 세일즈 헬퍼) — IMPORTRANGE로 원본을 끌어온 사본
   SPREADSHEET_ID: "1TIjXcv7E7QQNcEhoRrKKUJwJt9ftlumKUuVQSs0bD8Y",
+  // 원본 전사광고영업디비
+  SOURCE_SPREADSHEET_ID: "1mq56pdu9hplHv1qjWT1Yf0xLYopsuRsG2CZ8ouTH8aA",
+  // true면 미러링 시트를 건너뛰고 원본에서 직접 읽는다.
+  // 미러링 IMPORTRANGE가 깨지거나(#VALUE!/#REF!) 범위 갱신을 놓쳐도 영향받지 않음.
+  USE_SOURCE_DIRECTLY: false,
+
   SHEET_NAME: "계약현황",
   MIN_END_YEAR: 2026,        // 종료일이 이 연도 이상인 건만 대상
 
@@ -128,6 +135,39 @@ function runOverdueNotification_(dryRun) {
   return summary;
 }
 
+// 시트에 나타나는 수식 오류값
+var OVERDUE_DM_ERROR_VALUES = ["#VALUE!", "#REF!", "#N/A", "#NAME?", "#DIV/0!", "#ERROR!", "#NULL!", "#NUM!"];
+
+/** 설정에 따라 미러링 시트 또는 원본에서 계약현황 탭을 연다 */
+function overdueOpenContractSheet_() {
+  var useSource = OVERDUE_DM_CONFIG.USE_SOURCE_DIRECTLY;
+  var id = useSource ? OVERDUE_DM_CONFIG.SOURCE_SPREADSHEET_ID : OVERDUE_DM_CONFIG.SPREADSHEET_ID;
+  var label = useSource ? "원본 전사광고영업디비" : "미러링 시트";
+
+  var ss;
+  try {
+    ss = SpreadsheetApp.openById(id);
+  } catch (e) {
+    throw new Error(label + "(" + id + ")를 열 수 없습니다. 열람 권한을 확인해주세요: " + e.message);
+  }
+
+  var sheet = ss.getSheetByName(OVERDUE_DM_CONFIG.SHEET_NAME);
+  if (!sheet) {
+    throw new Error(label + "에 '" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭이 없습니다. 존재하는 탭: " +
+      ss.getSheets().map(function(sh) { return sh.getName(); }).join(", "));
+  }
+  return { sheet: sheet, label: label, id: id };
+}
+
+/** 헤더 행에 수식 오류값이 있으면 그 값을 반환 (없으면 null) */
+function overdueFindErrorValue_(headers) {
+  for (var i = 0; i < headers.length; i++) {
+    var v = String(headers[i] == null ? "" : headers[i]).trim();
+    if (OVERDUE_DM_ERROR_VALUES.indexOf(v) >= 0) return v;
+  }
+  return null;
+}
+
 /** 헤더 행에서 컬럼 위치를 해석 */
 function overdueResolveColumns_(headers) {
   var norm = function(v) { return String(v == null ? "" : v).replace(/\s+/g, ""); };
@@ -159,19 +199,33 @@ function overdueResolveColumns_(headers) {
  * "대상 0건"이 나왔을 때 어느 필터에서 죽었는지 바로 알 수 있게 한다.
  */
 function collectOverdueItems_() {
-  var sheet = SpreadsheetApp.openById(OVERDUE_DM_CONFIG.SPREADSHEET_ID)
-                            .getSheetByName(OVERDUE_DM_CONFIG.SHEET_NAME);
-  if (!sheet) throw new Error("'" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭을 찾을 수 없습니다.");
+  var opened = overdueOpenContractSheet_();
+  var sheet = opened.sheet;
 
   var data = sheet.getDataRange().getValues();
-  if (data.length < 2) throw new Error("'" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭에 데이터 행이 없습니다.");
+  var shape = opened.label + " '" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭: " +
+              data.length + "행 x " + (data.length ? data[0].length : 0) + "열";
+  if (data.length < 2) throw new Error(shape + " — 데이터 행이 없습니다.");
 
   var headers = data[0];
+
+  // 미러링 IMPORTRANGE가 깨진 경우: 필터 문제가 아니라 데이터 자체가 안 들어온 것이므로
+  // 원인(수식 오류값 + A1 수식)을 그대로 드러낸다.
+  var errorValue = overdueFindErrorValue_(headers);
+  if (errorValue) {
+    throw new Error(
+      shape + " — 헤더 행이 " + errorValue + " 입니다. IMPORTRANGE 수식이 실패해서 데이터가 " +
+      "들어오지 않은 상태이므로 스크립트가 잡을 대상이 없습니다.\n" +
+      "A1 수식: " + (sheet.getRange(1, 1).getFormula() || "(수식 없음)") + "\n" +
+      "→ 시트 수식을 고치거나, OVERDUE_DM_CONFIG.USE_SOURCE_DIRECTLY = true 로 두고 " +
+      "원본 전사광고영업디비에서 직접 읽으세요.");
+  }
+
   var resolved = overdueResolveColumns_(headers);
   var col = resolved.col;
   if (resolved.missing.length > 0) {
-    throw new Error("계약현황 탭에서 다음 컬럼을 찾을 수 없습니다: " + resolved.missing.join(", ") +
-      " / 시트 컬럼 수=" + headers.length + " / 실제 헤더=[" + headers.join(" | ") + "]");
+    throw new Error(shape + " — 다음 컬럼을 찾을 수 없습니다: " + resolved.missing.join(", ") +
+      " / 실제 헤더=[" + headers.join(" | ") + "]");
   }
 
   var today = overdueStartOfDay_(new Date());
@@ -252,6 +306,53 @@ function collectOverdueItems_() {
     funnel: funnel, samples: samples, headers: headers,
     resolvedCol: col, fellBack: resolved.fellBack
   };
+}
+
+/**
+ * 데이터 소스 점검: 미러링 시트와 원본을 각각 열어보고
+ * 탭 목록 / 크기 / 계약현황 A1 수식 / 헤더 상태를 로그로 남긴다.
+ * "대상 0건"이 필터 문제인지 시트 문제인지 가리는 데 사용.
+ */
+function diagnoseSourceSheet() {
+  var lines = ["=== 데이터 소스 점검 ==="];
+
+  [{ id: OVERDUE_DM_CONFIG.SPREADSHEET_ID, label: "미러링 시트" },
+   { id: OVERDUE_DM_CONFIG.SOURCE_SPREADSHEET_ID, label: "원본 전사광고영업디비" }].forEach(function(target) {
+    lines.push("");
+    lines.push("[" + target.label + "] " + target.id);
+    var ss;
+    try {
+      ss = SpreadsheetApp.openById(target.id);
+    } catch (e) {
+      lines.push("  ❌ 열 수 없음 (열람 권한 확인 필요): " + e.message);
+      return;
+    }
+    lines.push("  파일명: " + ss.getName());
+    lines.push("  탭 목록: " + ss.getSheets().map(function(sh) {
+      return sh.getName() + "(" + sh.getLastRow() + "x" + sh.getLastColumn() + ")";
+    }).join(", "));
+
+    var sheet = ss.getSheetByName(OVERDUE_DM_CONFIG.SHEET_NAME);
+    if (!sheet) { lines.push("  ❌ '" + OVERDUE_DM_CONFIG.SHEET_NAME + "' 탭 없음"); return; }
+
+    var lastCol = Math.max(sheet.getLastColumn(), 1);
+    var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    var errorValue = overdueFindErrorValue_(headers);
+    lines.push("  A1 수식: " + (sheet.getRange(1, 1).getFormula() || "(수식 없음 / 값 직접 입력)"));
+    lines.push("  헤더(" + headers.length + "개): [" + headers.join(" | ") + "]");
+    if (errorValue) {
+      lines.push("  ❌ 헤더가 " + errorValue + " — 수식이 실패해 데이터가 들어오지 않았습니다.");
+    } else {
+      var resolved = overdueResolveColumns_(headers);
+      lines.push(resolved.missing.length
+        ? "  ❌ 누락 컬럼: " + resolved.missing.join(", ")
+        : "  ✅ 필요한 컬럼 모두 확인 (" + JSON.stringify(resolved.col) + ")");
+    }
+  });
+
+  var out = lines.join("\n");
+  Logger.log(out);
+  return out;
 }
 
 /** 왜 대상이 0건인지(혹은 몇 건인지) 단계별로 로그 출력 — 발송 안 함 */
