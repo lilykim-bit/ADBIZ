@@ -42,6 +42,9 @@ var OVERDUE_DM_CONFIG = {
   TEST_MODE: false,
   TEST_TARGET_SLACK_ID: "U07RBU2TKNH",  // 김승현
 
+  // 메시지 하단 "입금 정보 입력하러 가기" 링크. 비워두면 링크 블록을 넣지 않는다.
+  SHEET_LINK_URL: "",
+
   SEND_INTERVAL_MS: 300      // Slack rate limit 대비 발송 간 대기
 };
 
@@ -113,7 +116,7 @@ function runOverdueNotification_(dryRun) {
 
     for (var m = 0; m < messages.length; m++) {
       if (dryRun) {
-        Logger.log("[DRY RUN] → " + managerName + " (" + target + ")\n" + messages[m]);
+        Logger.log("[DRY RUN] → " + managerName + " (" + target + ")\n" + overdueRenderBlocks_(messages[m]));
         sent++;
         continue;
       }
@@ -131,7 +134,7 @@ function runOverdueNotification_(dryRun) {
     var fallbackMsgs = overdueBuildUnmappedMessages_(report.unmapped);
     for (var f = 0; f < fallbackMsgs.length; f++) {
       if (dryRun) {
-        Logger.log("[DRY RUN] → 폴백(" + OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID + ")\n" + fallbackMsgs[f]);
+        Logger.log("[DRY RUN] → 폴백(" + OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID + ")\n" + overdueRenderBlocks_(fallbackMsgs[f]));
         sent++;
       } else {
         sendOverdueSlackDM_(token, OVERDUE_DM_CONFIG.FALLBACK_SLACK_ID, fallbackMsgs[f]) ? sent++ : failed++;
@@ -421,103 +424,177 @@ function diagnoseOverdueFilters() {
   return out;
 }
 
+// ===== 메시지(Block Kit) 조립 =====
+
+function overdueSection_(text) {
+  return { type: "section", text: { type: "mrkdwn", text: text } };
+}
+function overdueDivider_() {
+  return { type: "divider" };
+}
+
+/**
+ * 불릿 목록을 Block Kit section으로. section 하나당 3000자 제한이 있으므로
+ * 길면 같은 제목 아래에서 여러 section으로 나눈다.
+ */
+function overdueListSections_(title, lines) {
+  var sections = [];
+  var buf = [], len = 0, first = true;
+  var flush = function() {
+    if (buf.length === 0) return;
+    var head = first && title ? title + "\n\n" : "";
+    sections.push(overdueSection_(head + buf.join("\n")));
+    buf = []; len = 0; first = false;
+  };
+  lines.forEach(function(line) {
+    if (len + line.length > 2500) flush();
+    buf.push(line);
+    len += line.length + 1;
+  });
+  flush();
+  return sections;
+}
+
+/** 섹션 묶음을 글자수 기준으로 여러 메시지로 분할 (매장을 잘라내지 않는다) */
+function overdueChunkSections_(sections) {
+  var chunks = [], current = [], len = 0;
+  sections.forEach(function(sec) {
+    var size = sec.text ? sec.text.text.length : 0;
+    if (current.length > 0 && len + size > OVERDUE_DM_CONFIG.MAX_CHARS_PER_DM) {
+      chunks.push(current); current = []; len = 0;
+    }
+    current.push(sec);
+    len += size;
+  });
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+/** 시트 바로가기 블록 (SHEET_LINK_URL이 설정된 경우에만) */
+function overdueLinkSection_() {
+  var url = OVERDUE_DM_CONFIG.SHEET_LINK_URL;
+  if (!url) return null;
+  return overdueSection_(":link: <" + url + "|입금 정보 입력하러 가기>");
+}
+
+/** 담당자 1명의 DM. 길면 여러 개로 분할해서 [{blocks, text}, ...] 반환 */
+function overdueBuildMessages_(managerName, entry) {
+  var NL = "\n";
+
+  // 광고 상품별 섹션 (연체 오래된 건이 위로)
+  var adSections = [];
+  Object.keys(entry.ads).sort().forEach(function(adTitle) {
+    var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
+    var amount = stores.reduce(function(sum, st) { return sum + st.price; }, 0);
+    var lines = stores.map(function(st) {
+      return "▪️ " + st.storeName + "(" + st.seq + ") — *" + overdueWon_(st.price) + "*" +
+             " · 마감 " + overdueMmdd_(st.dueDate) + " (D+" + st.overdueDays + ")";
+    });
+    var title = "*[" + adTitle + "]* " + stores.length + "건 · " + overdueWon_(amount);
+    adSections = adSections.concat(overdueListSections_(title, lines));
+  });
+
+  var chunks = overdueChunkSections_(adSections);
+
+  return chunks.map(function(chunk, idx) {
+    var part = chunks.length > 1 ? " (" + (idx + 1) + "/" + chunks.length + ")" : "";
+    var isLast = idx === chunks.length - 1;
+
+    var blocks = [];
+    blocks.push(overdueSection_(":loudspeaker: *입금 마감일 경과 미입금 알림*" + part));
+    blocks.push(overdueDivider_());
+    blocks.push(overdueSection_(
+      ":bar_chart: *" + managerName + "님 미수 현황*" + NL + NL +
+      "▪️ 대상 건수: *" + entry.count + "건*" + NL +
+      "▪️ 미입금 금액: *" + overdueWon_(entry.amount) + "*" + NL +
+      "▪️ 입금 마감일이 지났으나 아직 입금이 확인되지 않은 건입니다."));
+    blocks.push(overdueDivider_());
+    blocks = blocks.concat(chunk);
+
+    if (isLast) {
+      blocks.push(overdueDivider_());
+      blocks.push(overdueSection_(
+        ":white_check_mark: *요청 사항*" + NL + NL +
+        "▪️ 이미 입금이 완료되었다면 *입금일자와 주문번호를 반드시 입력*해 주세요." + NL +
+        "▪️ 앱시트 기반 데이터라 입력 전까지는 계속 미수로 집계됩니다."));
+      var link = overdueLinkSection_();
+      if (link) blocks.push(link);
+    }
+
+    return {
+      blocks: blocks,
+      text: managerName + "님, 입금 마감일 경과 미입금 " + entry.count + "건 · " + overdueWon_(entry.amount)
+    };
+  });
+}
+
 /** 슬랙 ID를 못 찾은 담당자들의 건을 폴백 수신자용으로 묶는다 */
 function overdueBuildUnmappedMessages_(unmapped) {
+  var NL = "\n";
   var names = Object.keys(unmapped).sort(function(a, b) {
     return unmapped[b].count - unmapped[a].count;
   });
   var totalCount = 0, totalAmount = 0;
   names.forEach(function(n) { totalCount += unmapped[n].count; totalAmount += unmapped[n].amount; });
 
-  var sections = names.map(function(name) {
+  var ownerSections = [];
+  names.forEach(function(name) {
     var entry = unmapped[name];
-    var lines = ["*" + name + "* " + entry.count + "건 · " + overdueWon_(entry.amount)];
+    var lines = [];
     Object.keys(entry.ads).sort().forEach(function(adTitle) {
       var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
-      lines.push("[" + adTitle + "]");
       stores.forEach(function(st) {
-        lines.push("· " + st.storeName + "(" + st.seq + ") — " + overdueWon_(st.price) +
-                   " · 마감 " + overdueMmdd_(st.dueDate) + " (D+" + st.overdueDays + ")");
+        lines.push("▪️ [" + adTitle + "] " + st.storeName + "(" + st.seq + ") — *" +
+                   overdueWon_(st.price) + "* · 마감 " + overdueMmdd_(st.dueDate) +
+                   " (D+" + st.overdueDays + ")");
       });
     });
-    return lines.join("\n");
+    var title = "*" + name + "* " + entry.count + "건 · " + overdueWon_(entry.amount);
+    ownerSections = ownerSections.concat(overdueListSections_(title, lines));
   });
 
-  function header(part) {
-    return "*퇴사자 미입금 알림*" + part + "\n\n" +
-           "*" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
-           "아래 건은 퇴사자가 입금 팔로우업을 하지 않고 간 건입니다. 확인 부탁드립니다.\n";
-  }
-  // 인라인 코드 안에서는 다른 서식이 적용되지 않으므로 백틱을 중첩하지 않는다
-  var footer = "`안내사항: 담당자가 재직 중인데 목록에 올라왔다면 슬랙 ID 매핑 누락이니 알려주세요.`";
-
-  var chunks = [], current = [], currentLen = 0;
-  sections.forEach(function(section) {
-    if (current.length > 0 && currentLen + section.length > OVERDUE_DM_CONFIG.MAX_CHARS_PER_DM) {
-      chunks.push(current); current = []; currentLen = 0;
-    }
-    current.push(section);
-    currentLen += section.length + 2;
-  });
-  if (current.length > 0) chunks.push(current);
+  var chunks = overdueChunkSections_(ownerSections);
 
   return chunks.map(function(chunk, idx) {
     var part = chunks.length > 1 ? " (" + (idx + 1) + "/" + chunks.length + ")" : "";
-    var body = header(part) + "\n" + chunk.join("\n\n");
-    return idx === chunks.length - 1 ? body + "\n\n" + footer : body;
-  });
-}
+    var isLast = idx === chunks.length - 1;
 
-/** 담당자 1명의 DM 본문 생성. 길면 여러 개로 분할해서 배열로 반환 */
-function overdueBuildMessages_(managerName, entry) {
-  // 광고 상품별 섹션: 연체가 오래된 건이 위로 오도록 정렬
-  var adTitles = Object.keys(entry.ads).sort();
-  var sections = adTitles.map(function(adTitle) {
-    var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
-    var amount = stores.reduce(function(sum, s) { return sum + s.price; }, 0);
+    var blocks = [];
+    blocks.push(overdueSection_(":rotating_light: *퇴사자 미입금 알림*" + part));
+    blocks.push(overdueDivider_());
+    blocks.push(overdueSection_(
+      ":bar_chart: *미수 현황*" + NL + NL +
+      "▪️ 대상 담당자: *" + names.length + "명*" + NL +
+      "▪️ 대상 건수: *" + totalCount + "건*" + NL +
+      "▪️ 미입금 금액: *" + overdueWon_(totalAmount) + "*"));
+    blocks.push(overdueDivider_());
+    blocks = blocks.concat(chunk);
 
-    var lines = ["*[" + adTitle + "]* " + stores.length + "건 · " + overdueWon_(amount)];
-    stores.forEach(function(s) {
-      lines.push("· " + s.storeName + "(" + s.seq + ") — " + overdueWon_(s.price) +
-                 " · 마감 " + overdueMmdd_(s.dueDate) + " (D+" + s.overdueDays + ")");
-    });
-    return lines.join("\n");
-  });
-
-  // Slack mrkdwn에서 굵게는 별표 하나(*텍스트*). 별표 두 개는 그대로 노출된다.
-  function header(part) {
-    return "*안녕하세요 " + managerName + "님, 입금 마감일 경과 미입금 알림입니다.*" + part + "\n\n" +
-           "*담당 매장 중 서명 완료 / 결제 미완료 " + entry.count + "건 · " + overdueWon_(entry.amount) + "*\n" +
-           "_입금 마감일이 지났으나 아직 입금이 확인되지 않은 매장 리스트입니다._\n";
-  }
-
-  // 안내사항은 인라인 코드로 감싸 한 줄로 — 본문보다 눈에 덜 띄게 구분
-  var footer = "`안내사항: 해당 내용은 앱시트 기반 데이터입니다. " +
-               "이미 입금되었다면 입금일자와 주문번호를 반드시 입력해 주세요.`";
-
-  // 섹션을 글자수 기준으로 묶기 (매장을 잘라내지 않고 메시지를 나눔)
-  var chunks = [];
-  var current = [];
-  var currentLen = 0;
-  sections.forEach(function(section) {
-    if (current.length > 0 && currentLen + section.length > OVERDUE_DM_CONFIG.MAX_CHARS_PER_DM) {
-      chunks.push(current);
-      current = [];
-      currentLen = 0;
+    if (isLast) {
+      blocks.push(overdueDivider_());
+      blocks.push(overdueSection_(
+        ":white_check_mark: *요청 사항*" + NL + NL +
+        "▪️ 아래 건은 퇴사자가 입금 팔로우업을 하지 않고 간 건입니다. 확인 부탁드립니다." + NL +
+        "▪️ 담당자가 재직 중인데 목록에 올라왔다면 슬랙 ID 매핑 누락이니 알려주세요."));
+      var link = overdueLinkSection_();
+      if (link) blocks.push(link);
     }
-    current.push(section);
-    currentLen += section.length + 2;
-  });
-  if (current.length > 0) chunks.push(current);
 
-  return chunks.map(function(chunk, idx) {
-    var part = chunks.length > 1 ? " (" + (idx + 1) + "/" + chunks.length + ")" : "";
-    var body = header(part) + "\n" + chunk.join("\n\n");
-    return idx === chunks.length - 1 ? body + "\n\n" + footer : body;
+    return {
+      blocks: blocks,
+      text: "퇴사자 미입금 알림 - " + totalCount + "건 · " + overdueWon_(totalAmount)
+    };
   });
 }
 
 // ===== 유틸 =====
+
+/** 드라이런 로그용: Block Kit 구조를 사람이 읽을 수 있는 텍스트로 */
+function overdueRenderBlocks_(message) {
+  return message.blocks.map(function(b) {
+    return b.type === "divider" ? "────────────" : b.text.text;
+  }).join("\n");
+}
 
 /** 시트 값(Date 객체 / "2026-03-05" / "2026. 3. 5 오전 12:00:00" 등)을 당일 0시 Date로 변환 */
 function overdueParseDate_(value) {
@@ -556,12 +633,13 @@ function overdueMmdd_(date) {
  * 슬랙 API를 이용해 특정 유저 ID로 1:1 DM 발송.
  * 성공 여부를 boolean으로 반환 (한 명 실패해도 나머지 발송이 중단되지 않게 예외를 흡수)
  */
-function sendOverdueSlackDM_(token, userId, text) {
+function sendOverdueSlackDM_(token, userId, message) {
+  var payload = { "channel": userId, "text": message.text, "blocks": message.blocks };
   var options = {
     "method": "post",
     "contentType": "application/json; charset=utf-8",
     "headers": { "Authorization": "Bearer " + token },
-    "payload": JSON.stringify({ "channel": userId, "text": text }),
+    "payload": JSON.stringify(payload),
     "muteHttpExceptions": true
   };
 
