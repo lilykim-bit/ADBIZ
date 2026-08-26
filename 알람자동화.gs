@@ -722,8 +722,10 @@ function pollReactions() {
   };
 
   let noChannel = 0, noMapping = 0;
+  let fatal = null;
 
   Object.keys(byTs).forEach(ts => {
+    if (fatal) return;
     const g = byTs[ts];
     let channel = g.channel;
 
@@ -735,8 +737,19 @@ function pollReactions() {
       if (!channel) { noChannel++; return; }
     }
 
-    if (checkSlackReaction(channel, ts)) confirmed.push.apply(confirmed, g.rowIdx);
+    // 스코프·토큰 문제는 트리거가 매시간 실패 메일을 보내게 만든다.
+    // 예외로 터뜨리는 대신 사유를 한 번 남기고 조용히 종료한다.
+    try {
+      if (checkSlackReaction(channel, ts)) confirmed.push.apply(confirmed, g.rowIdx);
+    } catch (e) {
+      fatal = e.message;
+    }
   });
+
+  if (fatal) {
+    Logger.log('리액션 조회를 중단했습니다.\n' + fatal);
+    return;
+  }
 
   if (noMapping > 0) Logger.log('담당자 매핑이 없어 리액션 확인을 건너뛴 DM: ' + noMapping + '건');
   if (noChannel > 0) Logger.log('DM 채널 조회 실패로 건너뛴 DM: ' + noChannel + '건 (봇 스코프 im:write 확인 필요)');
