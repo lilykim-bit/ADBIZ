@@ -712,6 +712,17 @@ function pollReactions() {
   const mapping = getOwnerSlackMap();
   const confirmed = [];   // [rowIdx...]
 
+  // 유저ID → DM채널ID 캐시. 같은 담당자의 과거 DM이 수십 건이면
+  // ts 그룹마다 conversations.open을 부르게 되므로 한 번만 조회한다.
+  const dmChannelCache = {};
+  const resolveChannel = function (slackId) {
+    if (slackId in dmChannelCache) return dmChannelCache[slackId];
+    dmChannelCache[slackId] = openDmChannel_(slackId);
+    return dmChannelCache[slackId];
+  };
+
+  let noChannel = 0, noMapping = 0;
+
   Object.keys(byTs).forEach(ts => {
     const g = byTs[ts];
     let channel = g.channel;
@@ -719,13 +730,18 @@ function pollReactions() {
     // 예전 행에는 DM채널ID가 없다. 유저ID로는 reactions.get이 동작하지 않으므로 변환한다.
     if (!channel) {
       const slackId = CONFIG.TEST_MODE ? CONFIG.TEST_TARGET_SLACK_ID : mapping[g.owner];
-      if (!slackId) return;
-      channel = openDmChannel_(slackId);
-      if (!channel) return;
+      if (!slackId) { noMapping++; return; }
+      channel = resolveChannel(slackId);
+      if (!channel) { noChannel++; return; }
     }
 
     if (checkSlackReaction(channel, ts)) confirmed.push.apply(confirmed, g.rowIdx);
   });
+
+  if (noMapping > 0) Logger.log('담당자 매핑이 없어 리액션 확인을 건너뛴 DM: ' + noMapping + '건');
+  if (noChannel > 0) Logger.log('DM 채널 조회 실패로 건너뛴 DM: ' + noChannel + '건 (봇 스코프 im:write 확인 필요)');
+  Logger.log('리액션 조회 대상 DM ' + Object.keys(byTs).length + '건 / conversations.open 호출 ' +
+             Object.keys(dmChannelCache).length + '회');
 
   if (confirmed.length === 0) { Logger.log('새로 확인된 항목 없음'); return; }
 
