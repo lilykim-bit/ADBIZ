@@ -76,12 +76,22 @@ var OVERDUE_DM_SIGNED_VALUE = "계약서 서명 완료";
 
 // ===== 메인 =====
 
-/** 실제 발송 (트리거 대상 함수) */
+/**
+ * 실제 발송 (트리거 대상 함수)
+ * 트리거는 매일 걸어두고 주말이면 여기서 조용히 스킵한다.
+ * 공휴일은 판단하지 않으므로 설·추석 등에도 그대로 발송된다.
+ */
 function notifyOverdueUnpaidStoresDedicatedDM() {
+  var dow = new Date().getDay(); // 0=일, 6=토
+  if (dow === 0 || dow === 6) {
+    var msg = "주말이라 발송 스킵 (" + (dow === 0 ? "일요일" : "토요일") + ")";
+    Logger.log(msg);
+    return msg;
+  }
   return runOverdueNotification_(false);
 }
 
-/** 발송 없이 로그로만 결과 확인 (드라이런) */
+/** 발송 없이 로그로만 결과 확인 (드라이런). 테스트를 위해 주말에도 동작한다. */
 function previewOverdueUnpaidDMs() {
   return runOverdueNotification_(true);
 }
@@ -421,12 +431,12 @@ function overdueBuildUnmappedMessages_(unmapped) {
 
   var sections = names.map(function(name) {
     var entry = unmapped[name];
-    var lines = ["👤 *" + name + "* " + entry.count + "건 · " + overdueWon_(entry.amount)];
+    var lines = ["*" + name + "* " + entry.count + "건 · " + overdueWon_(entry.amount)];
     Object.keys(entry.ads).sort().forEach(function(adTitle) {
       var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
-      lines.push("  📦 [" + adTitle + "]");
+      lines.push("[" + adTitle + "]");
       stores.forEach(function(st) {
-        lines.push("    • " + st.storeName + "(" + st.seq + ") — " + overdueWon_(st.price) +
+        lines.push("· " + st.storeName + "(" + st.seq + ") — " + overdueWon_(st.price) +
                    " · 마감 " + overdueMmdd_(st.dueDate) + " (D+" + st.overdueDays + ")");
       });
     });
@@ -434,12 +444,12 @@ function overdueBuildUnmappedMessages_(unmapped) {
   });
 
   function header(part) {
-    return "🚨 *퇴사자 미입금 알림*" + part + "\n\n" +
-           "🔴 *" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
+    return "*퇴사자 미입금 알림*" + part + "\n\n" +
+           "*" + names.length + "명 / " + totalCount + "건 · " + overdueWon_(totalAmount) + "*\n" +
            "아래 건은 퇴사자가 입금 팔로우업을 하지 않고 간 건입니다. 확인 부탁드립니다.\n";
   }
-  var footer = "⚠️ 담당자가 재직 중인데 목록에 올라왔다면 슬랙 ID 매핑이 누락된 경우이니 알려주세요.\n" +
-               "(스크립트의 `OVERDUE_DM_SLACK_USER_IDS`에 추가하면 담당자 본인에게 직접 발송됩니다.)";
+  // 인라인 코드 안에서는 다른 서식이 적용되지 않으므로 백틱을 중첩하지 않는다
+  var footer = "`안내사항: 담당자가 재직 중인데 목록에 올라왔다면 슬랙 ID 매핑 누락이니 알려주세요.`";
 
   var chunks = [], current = [], currentLen = 0;
   sections.forEach(function(section) {
@@ -466,23 +476,24 @@ function overdueBuildMessages_(managerName, entry) {
     var stores = entry.ads[adTitle].sort(function(a, b) { return b.overdueDays - a.overdueDays; });
     var amount = stores.reduce(function(sum, s) { return sum + s.price; }, 0);
 
-    var lines = ["📦 *[" + adTitle + "]* " + stores.length + "건 · " + overdueWon_(amount)];
+    var lines = ["*[" + adTitle + "]* " + stores.length + "건 · " + overdueWon_(amount)];
     stores.forEach(function(s) {
-      lines.push("  • " + s.storeName + "(" + s.seq + ") — " + overdueWon_(s.price) +
+      lines.push("· " + s.storeName + "(" + s.seq + ") — " + overdueWon_(s.price) +
                  " · 마감 " + overdueMmdd_(s.dueDate) + " (D+" + s.overdueDays + ")");
     });
     return lines.join("\n");
   });
 
+  // Slack mrkdwn에서 굵게는 별표 하나(*텍스트*). 별표 두 개는 그대로 노출된다.
   function header(part) {
-    return "📢 *안녕하세요 " + managerName + "님, 입금 마감일 경과 미입금 알림입니다.*" + part + "\n\n" +
-           "🔴 *담당 매장 중 서명 완료 / 결제 미완료 " + entry.count + "건 · " + overdueWon_(entry.amount) + "*\n" +
+    return "*안녕하세요 " + managerName + "님, 입금 마감일 경과 미입금 알림입니다.*" + part + "\n\n" +
+           "*담당 매장 중 서명 완료 / 결제 미완료 " + entry.count + "건 · " + overdueWon_(entry.amount) + "*\n" +
            "_입금 마감일이 지났으나 아직 입금이 확인되지 않은 매장 리스트입니다._\n";
   }
 
-  var footer = "⚠️ *안내사항*\n" +
-               "• 해당 내용은 앱시트 기반으로 가져오는 데이터입니다.\n" +
-               "• 앱시트 상에서는 미수로 확인되니, *이미 입금이 완료되었다면 입금일자와 주문번호를 반드시 입력*해 주시기 바랍니다 🙏";
+  // 안내사항은 인라인 코드로 감싸 한 줄로 — 본문보다 눈에 덜 띄게 구분
+  var footer = "`안내사항: 해당 내용은 앱시트 기반 데이터입니다. " +
+               "이미 입금되었다면 입금일자와 주문번호를 반드시 입력해 주세요.`";
 
   // 섹션을 글자수 기준으로 묶기 (매장을 잘라내지 않고 메시지를 나눔)
   var chunks = [];
