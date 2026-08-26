@@ -535,6 +535,12 @@ function sendDMs() {
   const mapping = getOwnerSlackMap();
   let sentOwners = 0, failedOwners = 0;
 
+  // 발송 결과를 모았다가 마지막에 범위 단위로 한 번에 쓴다.
+  // (행마다 setValue를 부르면 200건 기준 수백 번의 API 왕복이 발생한다)
+  const sendCols = rows.map(r => [r[iLastDM], r[iTs]]);   // 마지막DM발송일, DM메시지TS (인접)
+  const chanCol = rows.map(r => [r[iChannel]]);           // DM채널ID (끝 컬럼)
+  let touched = 0;
+
   Object.keys(groups).forEach(owner => {
     const slackId = CONFIG.TEST_MODE ? CONFIG.TEST_TARGET_SLACK_ID : mapping[owner];
     if (!slackId) { Logger.log('Slack ID 매핑 없음: ' + owner); return; }
@@ -551,12 +557,23 @@ function sendDMs() {
     if (!res) { failedOwners++; return; }
     sentOwners++;
     list.forEach(item => {
-      sheet.getRange(item.rowIndex, iLastDM + 1).setValue(now);
-      sheet.getRange(item.rowIndex, iTs + 1).setValue(res.ts);
+      const i = item.rowIndex - 2;
+      sendCols[i] = [now, res.ts];
       // 리액션 조회는 유저ID가 아니라 DM 채널ID(D…)를 요구한다. 발송 응답값을 저장해 둔다.
-      sheet.getRange(item.rowIndex, iChannel + 1).setValue(res.channel);
+      chanCol[i] = [res.channel];
+      touched++;
     });
   });
+
+  if (touched > 0 && rows.length > 0) {
+    if (iTs === iLastDM + 1) {
+      sheet.getRange(2, iLastDM + 1, rows.length, 2).setValues(sendCols);
+    } else {
+      sheet.getRange(2, iLastDM + 1, rows.length, 1).setValues(sendCols.map(v => [v[0]]));
+      sheet.getRange(2, iTs + 1, rows.length, 1).setValues(sendCols.map(v => [v[1]]));
+    }
+    sheet.getRange(2, iChannel + 1, rows.length, 1).setValues(chanCol);
+  }
 
   Logger.log('DM 발송: 담당자 ' + sentOwners + '명 성공' + (failedOwners ? ' / ' + failedOwners + '명 실패' : ''));
 
