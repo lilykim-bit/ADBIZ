@@ -771,6 +771,10 @@ function openDmChannel_(slackUserId) {
   return res.channel.id;
 }
 
+// 재시도해도 결과가 같은 치명적 오류 — 만나면 즉시 중단한다
+var SLACK_FATAL_ERRORS = ['missing_scope', 'invalid_auth', 'not_authed', 'token_revoked',
+                          'account_inactive', 'ratelimited'];
+
 function checkSlackReaction(channel, ts) {
   const url = 'https://slack.com/api/reactions.get?channel=' + encodeURIComponent(channel) +
               '&timestamp=' + encodeURIComponent(ts);
@@ -784,7 +788,19 @@ function checkSlackReaction(channel, ts) {
   catch (e) { Logger.log('리액션 조회 응답 파싱 실패: ' + response.getContentText().slice(0, 200)); return false; }
 
   // 조용히 false를 반환하면 리마인드가 영구히 반복되므로 실패 이유를 반드시 남긴다
-  if (!res.ok) { Logger.log('리액션 조회 실패 (' + channel + '/' + ts + '): ' + res.error); return false; }
+  if (!res.ok) {
+    // 스코프·토큰 문제는 1000건을 두드려도 결과가 같다. 로그를 채우고 실행시간만
+    // 잡아먹으므로 첫 건에서 바로 멈추고 조치 방법을 알린다.
+    if (SLACK_FATAL_ERRORS.indexOf(res.error) !== -1) {
+      throw new Error('Slack API 오류로 리액션 조회를 중단합니다: ' + res.error +
+        (res.needed ? ' (필요 스코프: ' + res.needed + ')' : '') +
+        (res.provided ? ' / 현재 스코프: ' + res.provided : '') +
+        '\n→ api.slack.com/apps > 해당 앱 > OAuth & Permissions 에서 스코프를 추가하고 ' +
+        '워크스페이스에 재설치(Reinstall)한 뒤, 새 봇 토큰을 스크립트 속성 SLACK_BOT_TOKEN에 갱신하세요.');
+    }
+    Logger.log('리액션 조회 실패 (' + channel + '/' + ts + '): ' + res.error);
+    return false;
+  }
   const reactions = res.message && res.message.reactions;
   return !!(reactions && reactions.length > 0);
 }
@@ -989,8 +1005,25 @@ function listTriggers() {
 
 /** ===================== 진단 ===================== */
 function diagnoseSlackAccess() {
-  const auth = slackCall_('auth.test', {});
+  // 응답 헤더 x-oauth-scopes 에 현재 토큰에 부여된 스코프가 들어온다
+  const response = UrlFetchApp.fetch('https://slack.com/api/auth.test', {
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + getSlackToken_() },
+    muteHttpExceptions: true
+  });
+  const auth = JSON.parse(response.getContentText());
   Logger.log('auth.test: ' + JSON.stringify(auth));
+
+  const headers = response.getHeaders();
+  const granted = String(headers['x-oauth-scopes'] || headers['X-OAuth-Scopes'] || '');
+  Logger.log('현재 봇 토큰 스코프: ' + (granted || '(응답에 없음)'));
+
+  const required = ['chat:write', 'reactions:read', 'im:write', 'im:history'];
+  const have = granted.split(',').map(function (v) { return v.trim(); });
+  const missing = required.filter(function (r) { return have.indexOf(r) === -1; });
+  Logger.log(missing.length
+    ? '❌ 누락 스코프: ' + missing.join(', ') + ' → 추가 후 워크스페이스 재설치 필요'
+    : '✅ 필요한 스코프 모두 보유');
 
   const info = JSON.parse(UrlFetchApp.fetch(
     'https://slack.com/api/conversations.info?channel=' + CONFIG.CHANNEL_ID,
