@@ -96,6 +96,74 @@ function setupMappingSheet() {
 }
 
 /**
+ * 알려진 담당자-SlackID 명부.
+ * 미수방지 봇(OverdueUnpaidDM.gs)의 하드코딩 명부와 동일한 값이며,
+ * addOwnerMappings()로 담당자매핑 탭에 채워 넣는다.
+ */
+const KNOWN_OWNER_SLACK_IDS = {
+  '김나현': 'U0B99RC7H08', '김상하': 'U0AG600HV1U', '김연아': 'U0BN7S7C6TH', '김현수': 'U0BHGG7FP98',
+  '남윤석': 'U0BQ3UL4Z5L', '남현욱': 'U07RH97HNQL', '신유빈': 'U09MXM4BV71', '우은수': 'U093FJ573FY',
+  '이도은': 'U093FJ7DZ8W', '이세한': 'U09BZ6JL60G', '이승준': 'U09E3L1KFQR', '이조은': 'U09GZ0H7928',
+  '이종익': 'U0AGLUM2G2V', '이하윤': 'U0AJ3LN8E3T', '이혜민': 'U0AJY0DSMPC', '전평정': 'U02QCTZT2PP',
+  '최원영': 'U0BLAHC00G3', '한창완': 'U057M7S5RA9', '홍성혁': 'U02TN1U2PQR', '김이슬': 'U09ACJEAJSJ',
+  '조완수': 'U027RCFP55W', '이지민': 'U0BGDNGHUBC', '김승현': 'U07RBU2TKNH'
+};
+
+/**
+ * 담당자매핑 탭에 누락된 담당자를 채운다. 여러 번 실행해도 안전하다.
+ *   - 이름이 없으면 새 행으로 추가
+ *   - 이름은 있고 SlackID가 비어 있으면 채움
+ *   - SlackID가 이미 다른 값이면 덮어쓰지 않고 충돌로 보고 (퇴사자 옛 ID 등 판단 필요)
+ */
+function addOwnerMappings() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CONFIG.MAPPING_SHEET);
+  if (!sheet) { setupMappingSheet(); sheet = ss.getSheetByName(CONFIG.MAPPING_SHEET); }
+
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const iName = colIndex(headers, '담당자명');
+  const iSlack = colIndex(headers, 'SlackID');
+
+  const existing = {};
+  data.slice(1).forEach(function (r, idx) {
+    const name = String(r[iName] == null ? '' : r[iName]).trim();
+    if (name) existing[name] = { id: String(r[iSlack] == null ? '' : r[iSlack]).trim(), rowNum: idx + 2 };
+  });
+
+  const toAdd = [], toFill = [], conflicts = [], unchanged = [];
+  Object.keys(KNOWN_OWNER_SLACK_IDS).forEach(function (name) {
+    const id = KNOWN_OWNER_SLACK_IDS[name];
+    const cur = existing[name];
+    if (!cur) { toAdd.push([name, id]); return; }
+    if (!cur.id) { toFill.push({ rowNum: cur.rowNum, name: name, id: id }); return; }
+    if (cur.id !== id) { conflicts.push(name + ' (시트: ' + cur.id + ' / 명부: ' + id + ')'); return; }
+    unchanged.push(name);
+  });
+
+  if (toAdd.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, iName + 1, toAdd.length, 1).setValues(toAdd.map(function (v) { return [v[0]]; }));
+    sheet.getRange(startRow, iSlack + 1, toAdd.length, 1).setValues(toAdd.map(function (v) { return [v[1]]; }));
+  }
+  toFill.forEach(function (t) { sheet.getRange(t.rowNum, iSlack + 1).setValue(t.id); });
+
+  Logger.log('추가 ' + toAdd.length + '명' + (toAdd.length ? ': ' + toAdd.map(function (v) { return v[0]; }).join(', ') : ''));
+  Logger.log('빈 SlackID 채움 ' + toFill.length + '명' + (toFill.length ? ': ' + toFill.map(function (t) { return t.name; }).join(', ') : ''));
+  Logger.log('이미 동일 ' + unchanged.length + '명');
+  if (conflicts.length > 0) {
+    Logger.log('⚠️ SlackID가 명부와 달라 건드리지 않은 담당자 ' + conflicts.length + '명 — 확인 필요:');
+    conflicts.forEach(function (c) { Logger.log('   ' + c); });
+  }
+
+  // 명부에 없는데 시트에만 있는 담당자 (퇴사자 등) 도 함께 알린다
+  const onlyInSheet = Object.keys(existing).filter(function (n) { return !(n in KNOWN_OWNER_SLACK_IDS); });
+  if (onlyInSheet.length > 0) {
+    Logger.log('시트에만 있는 담당자 (슬랙 계정 확인 필요): ' + onlyInSheet.join(', '));
+  }
+}
+
+/**
  * 상태시트 헤더 보정. STATE_HEADERS에 새 컬럼이 추가돼도
  * 시트를 수동으로 고치지 않아도 되게 오른쪽에 자동 추가한다.
  */
